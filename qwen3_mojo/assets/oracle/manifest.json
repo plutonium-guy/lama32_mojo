@@ -1,0 +1,39 @@
+{
+ "ids": [
+  151644,
+  872,
+  198,
+  3838,
+  374,
+  279,
+  6722,
+  315,
+  9625,
+  30,
+  151645,
+  198,
+  151644,
+  77091,
+  198
+ ],
+ "after_layer0": {
+  "file": "after_layer0.bin",
+  "shape": [
+   15,
+   1024
+  ]
+ },
+ "after_layer1": {
+  "file": "after_layer1.bin",
+  "shape": [
+   15,
+   1024
+  ]
+ },
+ "last_logits": {
+  "file": "last_logits.bin",
+  "shape": [
+   151936
+  ]
+ }
+}

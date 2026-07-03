@@ -1,0 +1,15 @@
+# pixi environments (detached to local APFS; exFAT cannot host conda envs)
+.pixi/
+
+# model weights (2.47 GB) — hf download unsloth/Llama-3.2-1B-Instruct
+assets/model/*.safetensors
+
+# oracle activation dumps (regenerate: pixi run oracle)
+assets/oracle/*.bin
+
+# macOS exFAT AppleDouble litter
+._*
+.DS_Store
+
+# build artifacts
+llama_chat

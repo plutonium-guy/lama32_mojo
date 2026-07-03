@@ -1,0 +1,6 @@
+.pixi/
+assets/model/*.safetensors
+assets/oracle/*.bin
+._*
+.DS_Store
+qwen_chat

@@ -1,0 +1,24 @@
+[workspace]
+authors = ["amiya <amiya19mandal@gmail.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "llama32_mojo"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+# interactive REPL (weights load once); pass a question for one-shot:
+#   pixi run chat "What is the capital of France?"
+chat = "mojo run -I src src/chat.mojo"
+# oracle validation + decode benchmark
+test = "mojo run -I src src/llama_gpu.mojo"
+# compiled binary (must still be launched via `pixi run` for libpython)
+build = "mojo build -I src src/chat.mojo -o llama_chat"
+# regenerate numpy ground truth in assets/oracle/
+oracle = "python scripts/gen_oracle.py"
+
+[dependencies]
+modular = ">=26.4.0,<27"
+python = ">=3.12"
+tokenizers = ">=0.22"
+numpy = ">=2"
+huggingface_hub = ">=1.20"

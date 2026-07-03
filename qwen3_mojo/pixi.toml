@@ -1,0 +1,23 @@
+[workspace]
+authors = ["amiya <amiya19mandal@gmail.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "qwen3_mojo"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+# shared kernels: ../src/llama_common.mojo, safetensors.mojo
+chat = "mojo run -I src -I ../src src/chat.mojo"
+test = "mojo run -I src -I ../src src/qwen_gpu.mojo"
+build = "mojo build -I src -I ../src src/chat.mojo -o qwen_chat"
+oracle = "python scripts/gen_oracle.py"
+bench = "python scripts/bench_python.py"
+download = "hf download Qwen/Qwen3-0.6B --local-dir assets/model"
+
+[dependencies]
+modular = ">=26.4.0,<27"
+python = ">=3.12"
+tokenizers = ">=0.22"
+numpy = ">=2"
+huggingface_hub = ">=1.20"
+pytorch = ">=2.12.0,<3"

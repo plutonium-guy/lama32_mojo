@@ -1,0 +1,21 @@
+[workspace]
+authors = ["amiya <amiya19mandal@gmail.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "llama31_mojo"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+# shared kernels live in ../src (llama_common.mojo, safetensors.mojo)
+chat = "mojo run -I src -I ../src src/chat.mojo"
+test = "mojo run -I src -I ../src src/llama_gpu.mojo"
+build = "mojo build -I src -I ../src src/chat.mojo -o llama_chat"
+oracle = "python scripts/gen_oracle.py"
+download = "hf download mlabonne/Meta-Llama-3.1-8B-Instruct-abliterated --local-dir assets/model"
+
+[dependencies]
+modular = ">=26.5.0.dev2026070123,<27"
+python = ">=3.12"
+tokenizers = ">=0.22"
+numpy = ">=2"
+huggingface_hub = ">=1.20"
