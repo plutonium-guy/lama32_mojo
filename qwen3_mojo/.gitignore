@@ -4,3 +4,5 @@ assets/oracle/*.bin
 ._*
 .DS_Store
 qwen_chat
+assets/model-q8/
+qwen_chat_q8
