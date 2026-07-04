@@ -119,6 +119,50 @@ def k_mm_w(w: UnsafePointer[UInt16, MutAnyOrigin],
         a[oy + idx] = tot.reduce_add()
 
 
+def k_mm_tile(w: UnsafePointer[UInt16, MutAnyOrigin],
+              a: UnsafePointer[Float32, MutAnyOrigin],
+              ox: Int, owt: Int, oy: Int, s: Int, m: Int, n: Int):
+    """Tiled y (s,n) = x (s,m) @ Wbf16 (n,m)^T: 8 rows x 8 cols per 32-thread
+    group. Reuses each x/w load 8x — main decode headroom vs k_mm_w.
+    Requires m % 256 == 0."""
+    var nrb = (s + 7) // 8
+    var blk = Int(block_idx.x)
+    var rb = (blk % nrb) * 8
+    var cb = (blk // nrb) * 8
+    var t = Int(thread_idx.x)
+    var acc = InlineArray[Float32, 64](fill=0)
+    var k = t * 8
+    while k < m:
+        var x = InlineArray[SIMD[DType.float32, 8], 8](fill=0)
+        for r in range(8):
+            x[r] = a.load[width=8](ox + min(rb + r, s - 1) * m + k)
+        for c in range(8):
+            var j = cb + c
+            if j >= n:
+                break
+            var w8 = bf8(w, owt + j * m + k)
+            for r in range(8):
+                acc[r * 8 + c] += (x[r] * w8).reduce_add()
+        k += TG_MM * 8
+    var shared = stack_allocation[
+        64 * TG_MM, Float32, address_space = AddressSpace.SHARED]()
+    for e in range(64):
+        shared[e * TG_MM + t] = acc[e]
+    barrier()
+    if t < 32:
+        for half in range(2):
+            var e = half * TG_MM + t
+            var r = rb + e // 8
+            var j = cb + e % 8
+            if r < s and j < n:
+                var tot = SIMD[DType.float32, 4](0)
+                var q = 0
+                while q < TG_MM:
+                    tot += shared.load[width=4](e * TG_MM + q)
+                    q += 4
+                a[oy + r * n + j] = tot.reduce_add()
+
+
 def k_embed_row(w: UnsafePointer[UInt16, MutAnyOrigin],
                 a: UnsafePointer[Float32, MutAnyOrigin],
                 oemb: Int, tok_id: Int, oy: Int, d: Int):
@@ -181,6 +225,51 @@ def k_rmsnorm_w(w: UnsafePointer[UInt16, MutAnyOrigin],
         k += TG * 4
 
 
+def k_rmsnorm2_w(w: UnsafePointer[UInt16, MutAnyOrigin],
+                 a: UnsafePointer[Float32, MutAnyOrigin],
+                 oxq: Int, oxk: Int, owtq: Int, owtk: Int,
+                 oyq: Int, oyk: Int, rowsq: Int, rowsk: Int, d: Int, eps: Float32):
+    """Fused per-head Q-norm + K-norm: one TG group per row, grid over both."""
+    var i = Int(block_idx.x)
+    var rows = rowsq + rowsk
+    if i >= rows:
+        return
+    var ox: Int
+    var owt: Int
+    var oy: Int
+    if i < rowsq:
+        ox = oxq + i * d
+        owt = owtq
+        oy = oyq + i * d
+    else:
+        var ri = i - rowsq
+        ox = oxk + ri * d
+        owt = owtk
+        oy = oyk + ri * d
+    var t = Int(thread_idx.x)
+    var shared = stack_allocation[TG, Float32, address_space = AddressSpace.SHARED]()
+    var acc = SIMD[DType.float32, 4](0)
+    var k = t * 4
+    while k < d:
+        var v = a.load[width=4](ox + k)
+        acc = v.fma(v, acc)
+        k += TG * 4
+    shared[t] = acc[0] + acc[1] + acc[2] + acc[3]
+    barrier()
+    var stride = TG // 2
+    while stride > 0:
+        if t < stride:
+            shared[t] += shared[t + stride]
+        barrier()
+        stride //= 2
+    var inv = Float32(1) / sqrt(shared[0] / Float32(d) + eps)
+    k = t * 4
+    while k < d:
+        var x4 = a.load[width=4](ox + k)
+        a.store(oy + k, bf4(w, owt + k) * x4 * inv)
+        k += TG * 4
+
+
 def k_rope_qk(a: UnsafePointer[Float32, MutAnyOrigin],
               oq: Int, ok: Int, oinv: Int, s: Int, pos0: Int,
               nheads: Int, nkv: Int, qdim: Int, kvdim: Int, half: Int):
@@ -207,6 +296,40 @@ def k_rope_qk(a: UnsafePointer[Float32, MutAnyOrigin],
     a[base + half + d] = x1 * c + x0 * sn
 
 
+def k_rope_qk_copy2(a: UnsafePointer[Float32, MutAnyOrigin],
+                    oq: Int, ok: Int, ov: Int, okc: Int, ovc: Int,
+                    oinv: Int, s: Int, pos0: Int,
+                    nheads: Int, nkv: Int, qdim: Int, kvdim: Int, half: Int):
+    """Fused RoPE on q/k + append k/v to KV cache."""
+    var nall = nheads + nkv
+    var nrope = s * nall * half
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx < nrope:
+        var i = idx // (nall * half)
+        var r = idx % (nall * half)
+        var h = r // half
+        var d = r % half
+        var freq = Float32(pos0 + i) * a[oinv + d]
+        var c = cos(freq)
+        var sn = sin(freq)
+        var base: Int
+        if h < nheads:
+            base = oq + i * qdim + h * 2 * half
+        else:
+            base = ok + i * kvdim + (h - nheads) * 2 * half
+        var x0 = a[base + d]
+        var x1 = a[base + half + d]
+        a[base + d] = x0 * c - x1 * sn
+        a[base + half + d] = x1 * c + x0 * sn
+    elif idx < nrope + 2 * s * kvdim:
+        var ci = idx - nrope
+        if ci < s * kvdim:
+            a[okc + pos0 * kvdim + ci] = a[ok + ci]
+        else:
+            var vi = ci - s * kvdim
+            a[ovc + pos0 * kvdim + vi] = a[ov + vi]
+
+
 def k_copy2(a: UnsafePointer[Float32, MutAnyOrigin],
             os1: Int, od1: Int, os2: Int, od2: Int, n: Int):
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
@@ -221,6 +344,41 @@ def k_res_add(a: UnsafePointer[Float32, MutAnyOrigin],
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     if i < n:
         a[oy + i] = a[ox + i] + a[oo + i]
+
+
+def k_res_add_rmsnorm(w: UnsafePointer[UInt16, MutAnyOrigin],
+                      a: UnsafePointer[Float32, MutAnyOrigin],
+                      ox: Int, oo: Int, owt: Int, oy: Int,
+                      rows: Int, d: Int, eps: Float32):
+    """Fused residual add + RMSNorm (one TG group per row)."""
+    var i = Int(block_idx.x)
+    if i >= rows:
+        return
+    var t = Int(thread_idx.x)
+    var shared = stack_allocation[TG, Float32, address_space = AddressSpace.SHARED]()
+    var acc = SIMD[DType.float32, 4](0)
+    var xb = ox + i * d
+    var ob = oo + i * d
+    var k = t * 4
+    while k < d:
+        var v = a.load[width=4](xb + k) + a.load[width=4](ob + k)
+        a.store(oy + i * d + k, v)
+        acc = v.fma(v, acc)
+        k += TG * 4
+    shared[t] = acc[0] + acc[1] + acc[2] + acc[3]
+    barrier()
+    var stride = TG // 2
+    while stride > 0:
+        if t < stride:
+            shared[t] += shared[t + stride]
+        barrier()
+        stride //= 2
+    var inv = Float32(1) / sqrt(shared[0] / Float32(d) + eps)
+    k = t * 4
+    while k < d:
+        var x4 = a.load[width=4](oy + i * d + k)
+        a.store(oy + i * d + k, bf4(w, owt + k) * x4 * inv)
+        k += TG * 4
 
 
 def k_add(a: UnsafePointer[Float32, MutAnyOrigin], ox: Int, oy: Int, n: Int):
@@ -244,12 +402,17 @@ def k_scores(a: UnsafePointer[Float32, MutAnyOrigin],
     if j > pos0 + i:
         a[o] = Float32(-3.0e38)
         return
-    var acc = Float32(0)
     var qb = oq + i * qdim + h * headdim
     var kb = okc + j * kvdim + (h // group) * headdim
-    for d in range(headdim):
-        acc += a[qb + d] * a[kb + d]
-    a[o] = acc / sqrt(Float32(headdim))
+    var acc4 = SIMD[DType.float32, 4](0)
+    var d = 0
+    while d + 4 <= headdim:
+        acc4 += a.load[width=4](qb + d) * a.load[width=4](kb + d)
+        d += 4
+    while d < headdim:
+        acc4[0] += a[qb + d] * a[kb + d]
+        d += 1
+    a[o] = acc4.reduce_add() / sqrt(Float32(headdim))
 
 
 def k_softmax_rows(a: UnsafePointer[Float32, MutAnyOrigin],
@@ -281,12 +444,21 @@ def k_att_out(a: UnsafePointer[Float32, MutAnyOrigin],
     var c = idx % hidden
     var h = c // headdim
     var d = c % headdim
-    var acc = Float32(0)
     var pb = osc + (h * s + i) * nctx
     var vb = ovc + (h // group) * headdim + d
-    for j in range(nctx):
-        acc += a[pb + j] * a[vb + j * kvdim]
-    a[oy + idx] = acc
+    var acc4 = SIMD[DType.float32, 4](0)
+    var j = 0
+    while j + 4 <= nctx:
+        var p4 = a.load[width=4](pb + j)
+        var v4 = SIMD[DType.float32, 4](
+            a[vb + j * kvdim], a[vb + (j + 1) * kvdim],
+            a[vb + (j + 2) * kvdim], a[vb + (j + 3) * kvdim])
+        acc4 += p4 * v4
+        j += 4
+    while j < nctx:
+        acc4[0] += a[pb + j] * a[vb + j * kvdim]
+        j += 1
+    a[oy + idx] = acc4.reduce_add()
 
 
 def k_swiglu_mul(a: UnsafePointer[Float32, MutAnyOrigin], og: Int, ou: Int, n: Int):
@@ -304,6 +476,35 @@ def k_export(a: UnsafePointer[Float32, MutAnyOrigin],
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     if i < n:
         g[odst + i] = a[osrc + i]
+
+
+def k_argmax(a: UnsafePointer[Float32, MutAnyOrigin],
+             oid: UnsafePointer[Int32, MutAnyOrigin], op: Int, n: Int):
+    """Parallel argmax over n logits; writes winning index to oid[0]."""
+    var t = Int(thread_idx.x)
+    var best_i = Int32(0)
+    var best_v = a[op]
+    var i = t
+    while i < n:
+        if a[op + i] > best_v:
+            best_v = a[op + i]
+            best_i = Int32(i)
+        i += TG_MM
+    var sval = stack_allocation[TG_MM, Float32, address_space = AddressSpace.SHARED]()
+    var sidx = stack_allocation[TG_MM, Int32, address_space = AddressSpace.SHARED]()
+    sval[t] = best_v
+    sidx[t] = best_i
+    barrier()
+    var stride = TG_MM // 2
+    while stride > 0:
+        if t < stride:
+            if sval[t + stride] > sval[t]:
+                sval[t] = sval[t + stride]
+                sidx[t] = sidx[t + stride]
+        barrier()
+        stride //= 2
+    if t == 0:
+        oid[0] = sidx[0]
 
 
 # ============================ host-side shared ================================
@@ -327,7 +528,9 @@ struct Kernels(Copyable, Movable):
     per-call kernel resolution of the enqueue_function[k_x](...) template
     path (~3x cheaper dispatch; decode is dispatch-bound)."""
     var mm: KPtr
+    var mmt: KPtr
     var rms: KPtr
+    var rms2: KPtr
     var rope: KPtr
     var copy2: KPtr
     var scores: KPtr
@@ -338,10 +541,13 @@ struct Kernels(Copyable, Movable):
     var add: KPtr
     var embg: KPtr
     var exp: KPtr
+    var argmax: KPtr
 
     def __init__(out self, ctx: DeviceContext) raises:
         self.mm = _box(ctx.compile_function[k_mm_w]())
+        self.mmt = _box(ctx.compile_function[k_mm_tile]())
         self.rms = _box(ctx.compile_function[k_rmsnorm_w]())
+        self.rms2 = _box(ctx.compile_function[k_rmsnorm2_w]())
         self.rope = _box(ctx.compile_function[k_rope_qk]())
         self.copy2 = _box(ctx.compile_function[k_copy2]())
         self.scores = _box(ctx.compile_function[k_scores]())
@@ -352,6 +558,7 @@ struct Kernels(Copyable, Movable):
         self.add = _box(ctx.compile_function[k_add]())
         self.embg = _box(ctx.compile_function[k_embed_gather]())
         self.exp = _box(ctx.compile_function[k_export]())
+        self.argmax = _box(ctx.compile_function[k_argmax]())
 
 
 struct Acts:
@@ -412,9 +619,9 @@ def llama3_inv_freq(cfg: Config) -> List[Float32]:
     return out^
 
 
-def mm_op(ctx: DeviceContext, w: DeviceBuffer[DType.uint16], mut a: Acts,
-          ox: Int, s: Int, m: Int, owt: Int, n: Int) raises -> Int:
-    """Chunked matmul; no dispatch exceeds MM_CHUNK_MACS (watchdog safety)."""
+def mm_op_w(ctx: DeviceContext, w: DeviceBuffer[DType.uint16], mut a: Acts,
+            ox: Int, s: Int, m: Int, owt: Int, n: Int) raises -> Int:
+    """Chunked k_mm_w matmul; used for s in {2,3}."""
     var oy = a.alloc(s * n)
     var total = s * n
     var chunk = max(BLOCK, MM_CHUNK_MACS // m)
@@ -429,6 +636,34 @@ def mm_op(ctx: DeviceContext, w: DeviceBuffer[DType.uint16], mut a: Acts,
         if e0 < total:
             ctx.synchronize()
     return oy
+
+
+def mm_op_t(ctx: DeviceContext, w: DeviceBuffer[DType.uint16], mut a: Acts,
+            ox: Int, s: Int, m: Int, owt: Int, n: Int) raises -> Int:
+    """Tiled matmul for s==1 decode and s>=4 prefill."""
+    var oy = a.alloc(s * n)
+    var ncb = ceildiv(n, 8)
+    var rows_per_chunk = max(8, ((1 << 30) // (n * m)) * 8)
+    var r0 = 0
+    while r0 < s:
+        var rows = min(rows_per_chunk, s - r0)
+        ctx.enqueue_function(
+            a.kn.mmt.bitcast[type_of(ctx.compile_function[k_mm_tile]())]()[],
+            w.unsafe_ptr(), a.buf.unsafe_ptr(),
+            ox + r0 * m, owt, oy + r0 * n, rows, m, n,
+            grid_dim=ceildiv(rows, 8) * ncb, block_dim=TG_MM)
+        r0 += rows
+        if r0 < s:
+            ctx.synchronize()
+    return oy
+
+
+def mm_op(ctx: DeviceContext, w: DeviceBuffer[DType.uint16], mut a: Acts,
+          ox: Int, s: Int, m: Int, owt: Int, n: Int) raises -> Int:
+    """Matmul dispatch: tiled for s==1 or s>=4, k_mm_w otherwise."""
+    if s == 1 or s >= 4:
+        return mm_op_t(ctx, w, a, ox, s, m, owt, n)
+    return mm_op_w(ctx, w, a, ox, s, m, owt, n)
 
 
 def rmsnorm_op(ctx: DeviceContext, w: DeviceBuffer[DType.uint16], mut a: Acts,
@@ -466,10 +701,16 @@ def run_layer(ctx: DeviceContext, w: DeviceBuffer[DType.uint16], mut a: Acts,
         okk = mm_op(ctx, w, a, xn, s, H, lo.k, KVD)
         ov = mm_op(ctx, w, a, xn, s, H, lo.v, KVD)
     if lo.q_norm >= 0:
-        oq = rmsnorm_op(ctx, w, a, oq, s * cfg.n_heads, lo.q_norm,
-                        cfg.head_dim, cfg.eps)
-        okk = rmsnorm_op(ctx, w, a, okk, s * cfg.n_kv, lo.k_norm,
-                         cfg.head_dim, cfg.eps)
+        var oqn = a.alloc(s * QD)
+        var okn = a.alloc(s * KVD)
+        ctx.enqueue_function(
+            a.kn.rms2.bitcast[type_of(ctx.compile_function[k_rmsnorm2_w]())]()[],
+            w.unsafe_ptr(), a.buf.unsafe_ptr(),
+            oq, okk, lo.q_norm, lo.k_norm, oqn, okn,
+            s * cfg.n_heads, s * cfg.n_kv, cfg.head_dim, cfg.eps,
+            grid_dim=s * cfg.n_heads + s * cfg.n_kv, block_dim=TG)
+        oq = oqn
+        okk = okn
     ctx.enqueue_function(
         a.kn.rope.bitcast[type_of(ctx.compile_function[k_rope_qk]())]()[],
         a.buf.unsafe_ptr(), oq, okk, oinv, s, pos0,
@@ -521,6 +762,21 @@ def run_layer(ctx: DeviceContext, w: DeviceBuffer[DType.uint16], mut a: Acts,
         a.buf.unsafe_ptr(), om, oh, s * H,
         grid_dim=ceildiv(s * H, BLOCK), block_dim=BLOCK)
     return oh
+
+
+def argmax_op(ctx: DeviceContext, mut a: Acts, lgbuf: DeviceBuffer[DType.float32],
+              argbuf: DeviceBuffer[DType.int32], op: Int, vocab: Int) raises:
+    """GPU argmax over logits in lgbuf; result in argbuf[0]."""
+    ctx.enqueue_function(
+        a.kn.argmax.bitcast[type_of(ctx.compile_function[k_argmax]())]()[],
+        lgbuf.unsafe_ptr(), argbuf.unsafe_ptr(), op, vocab,
+        grid_dim=1, block_dim=TG_MM)
+
+
+def read_argmax_gpu(argbuf: DeviceBuffer[DType.int32]) raises -> Int:
+    """Read GPU argmax result (4-byte host map)."""
+    with argbuf.map_to_host() as h:
+        return Int(h[0])
 
 
 def read_argmax_buf(lgbuf: DeviceBuffer[DType.float32], vocab: Int) raises -> Int:

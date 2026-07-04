@@ -16,7 +16,7 @@ from std.gpu import block_dim, block_idx, thread_idx, barrier
 from std.gpu.memory import AddressSpace
 from llama_common import (
     Config, LayerOffs, Acts, BLOCK, TG, TG_MM, PAD, MM_CHUNK_MACS, KPtr,
-    rmsnorm_op, k_rope_qk, k_copy2, k_res_add, k_add, k_swiglu_mul,
+    rmsnorm_op, k_rmsnorm2_w, k_rope_qk, k_copy2, k_res_add, k_add, k_swiglu_mul,
     k_softmax_rows, k_scores, k_att_out,
 )
 
@@ -169,10 +169,16 @@ def run_layer_q8(ctx: DeviceContext, w: DeviceBuffer[DType.uint16],
         okk = mm_q8_op(ctx, w, a, qk, xn, s, H, lo.k, KVD)
         ov = mm_q8_op(ctx, w, a, qk, xn, s, H, lo.v, KVD)
     if lo.q_norm >= 0:
-        oq = rmsnorm_op(ctx, w, a, oq, s * cfg.n_heads, lo.q_norm,
-                        cfg.head_dim, cfg.eps)
-        okk = rmsnorm_op(ctx, w, a, okk, s * cfg.n_kv, lo.k_norm,
-                         cfg.head_dim, cfg.eps)
+        var oqn = a.alloc(s * QD)
+        var okn = a.alloc(s * KVD)
+        ctx.enqueue_function(
+            a.kn.rms2.bitcast[type_of(ctx.compile_function[k_rmsnorm2_w]())]()[],
+            w.unsafe_ptr(), a.buf.unsafe_ptr(),
+            oq, okk, lo.q_norm, lo.k_norm, oqn, okn,
+            s * cfg.n_heads, s * cfg.n_kv, cfg.head_dim, cfg.eps,
+            grid_dim=s * cfg.n_heads + s * cfg.n_kv, block_dim=TG)
+        oq = oqn
+        okk = okn
     ctx.enqueue_function(
         a.kn.rope.bitcast[type_of(ctx.compile_function[k_rope_qk]())]()[],
         a.buf.unsafe_ptr(), oq, okk, oinv, s, pos0,

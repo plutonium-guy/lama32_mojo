@@ -15,9 +15,9 @@ from std.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import block_dim, block_idx, thread_idx, barrier
 from std.gpu.memory import AddressSpace
 from llama_common import (
-    Config, LayerOffs, Acts, BLOCK, PAD, TG_MM, bf, bf4, bf8,
-    mm_op, rmsnorm_op, k_rope_qk, k_copy2, k_res_add, k_add, k_swiglu_mul,
-    k_softmax_rows, k_att_out, KPtr,
+    Config, LayerOffs, Acts, BLOCK, PAD, TG_MM, TG,
+    bf, bf4, bf8, mm_op, rmsnorm_op, k_rope_qk, k_res_add, k_add, k_swiglu_mul,
+    k_softmax_rows, k_att_out, k_rmsnorm2_w, k_res_add_rmsnorm, KPtr,
 )
 
 
@@ -30,55 +30,12 @@ def _box[T: Movable](var f: T) -> KPtr:
 # ============================ kernels =========================================
 
 
-def k_mm_tile(w: UnsafePointer[UInt16, MutAnyOrigin],
-              a: UnsafePointer[Float32, MutAnyOrigin],
-              ox: Int, owt: Int, oy: Int, s: Int, m: Int, n: Int):
-    """Tiled y (s,n) = x (s,m) @ Wbf16 (n,m)^T: 8 rows x 8 cols per 32-thread
-    group. The shared k_mm_w does one output per group — optimal for s == 1
-    but ~2 KB memory traffic per output; the tile reuses each x/w load 8x,
-    which dominates for the seq-level forwards here. Requires m % 256 == 0."""
-    var nrb = (s + 7) // 8
-    var blk = Int(block_idx.x)
-    var rb = (blk % nrb) * 8
-    var cb = (blk // nrb) * 8
-    var t = Int(thread_idx.x)
-    var acc = InlineArray[Float32, 64](fill=0)
-    var k = t * 8
-    while k < m:
-        var x = InlineArray[SIMD[DType.float32, 8], 8](fill=0)
-        for r in range(8):
-            x[r] = a.load[width=8](ox + min(rb + r, s - 1) * m + k)
-        for c in range(8):
-            var j = cb + c
-            if j >= n:
-                break
-            var w8 = bf8(w, owt + j * m + k)
-            for r in range(8):
-                acc[r * 8 + c] += (x[r] * w8).reduce_add()
-        k += TG_MM * 8
-    var shared = stack_allocation[
-        64 * TG_MM, Float32, address_space = AddressSpace.SHARED]()
-    for e in range(64):
-        shared[e * TG_MM + t] = acc[e]
-    barrier()
-    if t < 32:
-        for half in range(2):
-            var e = half * TG_MM + t
-            var r = rb + e // 8
-            var j = cb + e % 8
-            if r < s and j < n:
-                var tot = SIMD[DType.float32, 4](0)
-                var q = 0
-                while q < TG_MM:
-                    tot += shared.load[width=4](e * TG_MM + q)
-                    q += 4
-                a[oy + r * n + j] = tot.reduce_add()
-
-
 def k_scores_bidir(a: UnsafePointer[Float32, MutAnyOrigin],
                    oq: Int, okc: Int, osc: Int, s: Int, nctx: Int,
-                   nheads: Int, group: Int, qdim: Int, kvdim: Int, headdim: Int):
-    """GQA scores (heads, s, nctx) with full bidirectional attention."""
+                   nheads: Int, group: Int, qdim: Int, kvdim: Int, headdim: Int,
+                   blen: Int):
+    """GQA scores (heads, s, nctx) with full bidirectional attention.
+    If blen > 0, s = batch * blen and attention is block-diagonal."""
     var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     if idx >= nheads * s * nctx:
         return
@@ -86,12 +43,17 @@ def k_scores_bidir(a: UnsafePointer[Float32, MutAnyOrigin],
     var r = idx % (s * nctx)
     var i = r // nctx
     var j = r % nctx
-    var acc = Float32(0)
+    if blen > 0 and (i // blen) != (j // blen):
+        a[osc + idx] = Float32(-3.0e38)
+        return
     var qb = oq + i * qdim + h * headdim
     var kb = okc + j * kvdim + (h // group) * headdim
-    for d in range(headdim):
-        acc += a[qb + d] * a[kb + d]
-    a[osc + idx] = acc / sqrt(Float32(headdim))
+    var acc4 = SIMD[DType.float32, 4](0)
+    var d = 0
+    while d < headdim:
+        acc4 += a.load[width=4](qb + d) * a.load[width=4](kb + d)
+        d += 4
+    a[osc + idx] = acc4.reduce_add() / sqrt(Float32(headdim))
 
 
 def k_ov_embed(w: UnsafePointer[UInt16, MutAnyOrigin],
@@ -114,6 +76,34 @@ def k_ov_embed(w: UnsafePointer[UInt16, MutAnyOrigin],
             var id = Int(oids[c * L + t]) + c * vocab
             acc += bf(w, oaudio + id * H + d)
         a[oy + idx] = acc
+
+
+def k_ov_embed_pair(w: UnsafePointer[UInt16, MutAnyOrigin],
+                    a: UnsafePointer[Float32, MutAnyOrigin],
+                    oids0: UnsafePointer[Int32, MutAnyOrigin],
+                    oids1: UnsafePointer[Int32, MutAnyOrigin],
+                    otext: Int, oaudio: Int, oy: Int,
+                    L: Int, H: Int, astart0: Int, astart1: Int,
+                    ncb: Int, vocab: Int):
+    """Embed two (ncb, L) id sequences into stacked rows [0..L) and [L..2L)."""
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx >= 2 * L * H:
+        return
+    var batch = idx // (L * H)
+    var rest = idx % (L * H)
+    var t = rest // H
+    var d = rest % H
+    var oids = oids0 if batch == 0 else oids1
+    var astart = astart0 if batch == 0 else astart1
+    var row = oy + batch * L * H + idx % (L * H)
+    if t < astart:
+        a[row] = bf(w, otext + Int(oids[t]) * H + d)
+    else:
+        var acc = Float32(0)
+        for c in range(ncb):
+            var id = Int(oids[c * L + t]) + c * vocab
+            acc += bf(w, oaudio + id * H + d)
+        a[row] = acc
 
 
 def k_cfg_predict(a: UnsafePointer[Float32, MutAnyOrigin],
@@ -288,9 +278,9 @@ def k_export_slice(a: UnsafePointer[Float32, MutAnyOrigin],
 
 
 struct OvKernels(Copyable, Movable):
-    var mmt: KPtr
     var scores: KPtr
     var embed: KPtr
+    var embedpair: KPtr
     var cfg: KPtr
     var conv: KPtr
     var convtr: KPtr
@@ -300,9 +290,9 @@ struct OvKernels(Copyable, Movable):
     var exp: KPtr
 
     def __init__(out self, ctx: DeviceContext) raises:
-        self.mmt = _box(ctx.compile_function[k_mm_tile]())
         self.scores = _box(ctx.compile_function[k_scores_bidir]())
         self.embed = _box(ctx.compile_function[k_ov_embed]())
+        self.embedpair = _box(ctx.compile_function[k_ov_embed_pair]())
         self.cfg = _box(ctx.compile_function[k_cfg_predict]())
         self.conv = _box(ctx.compile_function[k_conv1d]())
         self.convtr = _box(ctx.compile_function[k_convtr1d]())
@@ -312,33 +302,9 @@ struct OvKernels(Copyable, Movable):
         self.exp = _box(ctx.compile_function[k_export_slice]())
 
 
-def mm_op_t(ctx: DeviceContext, w: DeviceBuffer[DType.uint16], mut a: Acts,
-            kn: OvKernels, ox: Int, s: Int, m: Int, owt: Int,
-            n: Int) raises -> Int:
-    """Tiled matmul for multi-row inputs; falls back to k_mm_w for s < 4.
-    Chunks row blocks so one dispatch stays under the watchdog budget."""
-    if s < 4:
-        return mm_op(ctx, w, a, ox, s, m, owt, n)
-    var oy = a.alloc(s * n)
-    var ncb = ceildiv(n, 8)
-    var rows_per_chunk = max(8, ((1 << 30) // (n * m)) * 8)
-    var r0 = 0
-    while r0 < s:
-        var rows = min(rows_per_chunk, s - r0)
-        ctx.enqueue_function(
-            kn.mmt.bitcast[type_of(ctx.compile_function[k_mm_tile]())]()[],
-            w.unsafe_ptr(), a.buf.unsafe_ptr(),
-            ox + r0 * m, owt, oy + r0 * n, rows, m, n,
-            grid_dim=ceildiv(rows, 8) * ncb, block_dim=TG_MM)
-        r0 += rows
-        if r0 < s:
-            ctx.synchronize()
-    return oy
-
-
 def run_layer_bidir(ctx: DeviceContext, w: DeviceBuffer[DType.uint16],
                     mut a: Acts, kn: OvKernels, cfg: Config, lo: LayerOffs,
-                    ox: Int, s: Int, oinv: Int) raises -> Int:
+                    ox: Int, s: Int, oinv: Int, blen: Int = 0) raises -> Int:
     """One pre-norm GQA block with full bidirectional attention over s tokens.
 
     No KV cache: k/v live in per-call scratch (every diffusion step recomputes
@@ -348,51 +314,57 @@ def run_layer_bidir(ctx: DeviceContext, w: DeviceBuffer[DType.uint16],
     var QD = cfg.q_dim()
     var KVD = cfg.kv_dim()
     var xn = rmsnorm_op(ctx, w, a, ox, s, lo.in_norm, H, cfg.eps)
-    var oq = mm_op_t(ctx, w, a, kn, xn, s, H, lo.q, QD)
-    var okk = mm_op_t(ctx, w, a, kn, xn, s, H, lo.k, KVD)
-    var ov = mm_op_t(ctx, w, a, kn, xn, s, H, lo.v, KVD)
+    var oq = mm_op(ctx, w, a, xn, s, H, lo.q, QD)
+    var okk = mm_op(ctx, w, a, xn, s, H, lo.k, KVD)
+    var ov = mm_op(ctx, w, a, xn, s, H, lo.v, KVD)
     if lo.q_norm >= 0:
-        oq = rmsnorm_op(ctx, w, a, oq, s * cfg.n_heads, lo.q_norm,
-                        cfg.head_dim, cfg.eps)
-        okk = rmsnorm_op(ctx, w, a, okk, s * cfg.n_kv, lo.k_norm,
-                         cfg.head_dim, cfg.eps)
+        var oqn = a.alloc(s * QD)
+        var okn = a.alloc(s * KVD)
+        ctx.enqueue_function(
+            a.kn.rms2.bitcast[type_of(ctx.compile_function[k_rmsnorm2_w]())]()[],
+            w.unsafe_ptr(), a.buf.unsafe_ptr(),
+            oq, okk, lo.q_norm, lo.k_norm, oqn, okn,
+            s * cfg.n_heads, s * cfg.n_kv, cfg.head_dim, cfg.eps,
+            grid_dim=s * cfg.n_heads + s * cfg.n_kv, block_dim=TG)
+        oq = oqn
+        okk = okn
     ctx.enqueue_function(
         a.kn.rope.bitcast[type_of(ctx.compile_function[k_rope_qk]())]()[],
         a.buf.unsafe_ptr(), oq, okk, oinv, s, 0,
         cfg.n_heads, cfg.n_kv, QD, KVD, cfg.half(),
         grid_dim=ceildiv(s * (cfg.n_heads + cfg.n_kv) * cfg.half(), BLOCK),
         block_dim=BLOCK)
-    var osc = a.alloc(cfg.n_heads * s * s)
+    var nctx = s
+    var osc = a.alloc(cfg.n_heads * s * nctx)
     ctx.enqueue_function(
         kn.scores.bitcast[type_of(ctx.compile_function[k_scores_bidir]())]()[],
-        a.buf.unsafe_ptr(), oq, okk, osc, s, s,
-        cfg.n_heads, cfg.group(), QD, KVD, cfg.head_dim,
-        grid_dim=ceildiv(cfg.n_heads * s * s, BLOCK), block_dim=BLOCK)
+        a.buf.unsafe_ptr(), oq, okk, osc, s, nctx,
+        cfg.n_heads, cfg.group(), QD, KVD, cfg.head_dim, blen,
+        grid_dim=ceildiv(cfg.n_heads * s * nctx, BLOCK), block_dim=BLOCK)
     ctx.enqueue_function(
         a.kn.softmax.bitcast[type_of(ctx.compile_function[k_softmax_rows]())]()[],
-        a.buf.unsafe_ptr(), osc, cfg.n_heads * s, s,
+        a.buf.unsafe_ptr(), osc, cfg.n_heads * s, nctx,
         grid_dim=ceildiv(cfg.n_heads * s, BLOCK), block_dim=BLOCK)
-    # k_att_out reads a v "cache"; v rows are already contiguous at ov.
     var oao = a.alloc(s * QD)
     ctx.enqueue_function(
         a.kn.attout.bitcast[type_of(ctx.compile_function[k_att_out]())]()[],
-        a.buf.unsafe_ptr(), osc, ov, oao, s, s,
+        a.buf.unsafe_ptr(), osc, ov, oao, s, nctx,
         QD, KVD, cfg.head_dim, cfg.group(),
         grid_dim=ceildiv(s * QD, BLOCK), block_dim=BLOCK)
-    var oo = mm_op_t(ctx, w, a, kn, oao, s, QD, lo.o, H)
+    var oo = mm_op(ctx, w, a, oao, s, QD, lo.o, H)
     var oh = a.alloc(s * H)
     ctx.enqueue_function(
         a.kn.resadd.bitcast[type_of(ctx.compile_function[k_res_add]())]()[],
         a.buf.unsafe_ptr(), ox, oo, oh, s * H,
         grid_dim=ceildiv(s * H, BLOCK), block_dim=BLOCK)
     var oz = rmsnorm_op(ctx, w, a, oh, s, lo.post_norm, H, cfg.eps)
-    var og = mm_op_t(ctx, w, a, kn, oz, s, H, lo.gate, cfg.inter)
-    var ou = mm_op_t(ctx, w, a, kn, oz, s, H, lo.up, cfg.inter)
+    var og = mm_op(ctx, w, a, oz, s, H, lo.gate, cfg.inter)
+    var ou = mm_op(ctx, w, a, oz, s, H, lo.up, cfg.inter)
     ctx.enqueue_function(
         a.kn.swiglu.bitcast[type_of(ctx.compile_function[k_swiglu_mul]())]()[],
         a.buf.unsafe_ptr(), og, ou, s * cfg.inter,
         grid_dim=ceildiv(s * cfg.inter, BLOCK), block_dim=BLOCK)
-    var om = mm_op_t(ctx, w, a, kn, og, s, cfg.inter, lo.down, H)
+    var om = mm_op(ctx, w, a, og, s, cfg.inter, lo.down, H)
     ctx.enqueue_function(
         a.kn.add.bitcast[type_of(ctx.compile_function[k_add]())]()[],
         a.buf.unsafe_ptr(), om, oh, s * H,

@@ -16,7 +16,7 @@ from resident import Weights
 from llama_common import (
     Config, LayerOffs, Acts, BLOCK, PAD,
     k_export, rope_inv_freq, rmsnorm_op, read_f32_bin,
-    read_argmax_buf, read_logits_buf,
+    read_argmax_gpu, read_logits_buf, argmax_op,
 )
 from llama_q8 import Q8Kernels, run_layer_q8, mm_q8_op, k_embed_gather_q8
 from sample import argmax
@@ -59,6 +59,7 @@ struct QwenQ8:
     var a: Acts
     var qk: Q8Kernels
     var lgbuf: DeviceBuffer[DType.float32]
+    var argbuf: DeviceBuffer[DType.int32]
     var idbuf: DeviceBuffer[DType.int32]
     var lo: List[LayerOffs]
     var kc: List[Int]
@@ -76,6 +77,7 @@ struct QwenQ8:
         self.a = Acts(ctx, PAD + self.cfg.half() + cache + 32 * 1024 * 1024)
         self.qk = Q8Kernels(ctx)
         self.lgbuf = ctx.enqueue_create_buffer[DType.float32](PAD + VOCAB)
+        self.argbuf = ctx.enqueue_create_buffer[DType.int32](1)
         self.idbuf = ctx.enqueue_create_buffer[DType.int32](maxlen)
         self.lo = List[LayerOffs]()
         self.kc = List[Int]()
@@ -155,7 +157,9 @@ struct QwenQ8:
 
     def forward_argmax(mut self, ids: List[Int]) raises -> Int:
         self._run_forward(ids)
-        return read_argmax_buf(self.lgbuf, VOCAB)
+        argmax_op(self.ctx, self.a, self.lgbuf, self.argbuf, PAD, VOCAB)
+        self.ctx.synchronize()
+        return read_argmax_gpu(self.argbuf)
 
 
 def load_qwen_q8(ctx: DeviceContext, maxlen: Int) raises -> QwenQ8:

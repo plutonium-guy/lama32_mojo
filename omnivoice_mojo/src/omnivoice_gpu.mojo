@@ -16,12 +16,13 @@ from std.gpu.host import DeviceContext, DeviceBuffer
 from safetensors import SafeTensors
 from resident import Weights
 from llama_common import (
-    Config, LayerOffs, Acts, BLOCK, PAD,
-    rope_inv_freq, rmsnorm_op, read_f32_bin,
+    Config, LayerOffs, Acts, BLOCK, PAD, TG,
+    rope_inv_freq, rmsnorm_op, read_f32_bin, mm_op,
+    k_rmsnorm2_w, k_res_add_rmsnorm,
 )
 from ov_common import (
-    OvKernels, run_layer_bidir, mm_op_t,
-    k_ov_embed, k_cfg_predict, k_copy, k_export_slice,
+    OvKernels, run_layer_bidir,
+    k_ov_embed, k_ov_embed_pair, k_cfg_predict, k_copy, k_export_slice,
 )
 from sampler import MASK_ID, unmask_schedule, select_and_fill
 
@@ -113,6 +114,7 @@ struct OmniVoice:
     var oinv: Int
     var idc: DeviceBuffer[DType.int32]   # cond ids (8, L)
     var idu: DeviceBuffer[DType.int32]   # uncond ids (8, T)
+    var idu_pad: DeviceBuffer[DType.int32]  # uncond padded to (8, L)
     var pc: DeviceBuffer[DType.float32]  # (pred, conf) per (codebook, frame)
     var dbg: DeviceBuffer[DType.float32]  # verification readback
     var maxlen: Int
@@ -148,6 +150,7 @@ struct OmniVoice:
                 h[self.oinv + d] = inv[d]
         self.idc = ctx.enqueue_create_buffer[DType.int32](NCB * maxlen)
         self.idu = ctx.enqueue_create_buffer[DType.int32](NCB * maxlen)
+        self.idu_pad = ctx.enqueue_create_buffer[DType.int32](NCB * maxlen)
         self.pc = ctx.enqueue_create_buffer[DType.float32](2 * NCB * maxlen)
         self.dbg = ctx.enqueue_create_buffer[DType.float32](maxlen * HEADS_N)
         self.maxlen = maxlen
@@ -201,20 +204,55 @@ struct OmniVoice:
         with self.idu.map_to_host() as h:
             for i in range(NCB * T):
                 h[i] = Int32(tokens[i])
+        with self.idu_pad.map_to_host() as h:
+            for c in range(NCB):
+                for t in range(P):
+                    h[c * L + t] = Int32(MASK_ID)
+                for t in range(T):
+                    h[c * L + P + t] = Int32(tokens[c * T + t])
         return L
 
+    def forward_ids_batched(mut self, L: Int, astart: Int) raises -> Int:
+        """Batched cond+uncond backbone: one 2L forward with block-diagonal attn."""
+        var H = self.cfg.hidden
+        var s = 2 * L
+        var ox = self.a.alloc(s * H)
+        self.ctx.enqueue_function(
+            self.kn.embedpair.bitcast[
+                type_of(self.ctx.compile_function[k_ov_embed_pair]())]()[],
+            self.w.buf.unsafe_ptr(), self.a.buf.unsafe_ptr(),
+            self.idc.unsafe_ptr(), self.idu_pad.unsafe_ptr(),
+            self.w.o("llm.embed_tokens.weight"),
+            self.w.o("audio_embeddings.weight"),
+            ox, L, H, astart, astart, NCB, AVOCAB,
+            grid_dim=ceildiv(2 * L * H, BLOCK), block_dim=BLOCK)
+        for L_i in range(self.cfg.layers):
+            var mark = self.a.mark()
+            var oh = run_layer_bidir(self.ctx, self.w.buf, self.a, self.kn,
+                                     self.cfg, self.lo[L_i], ox, s, self.oinv, L)
+            self.ctx.enqueue_function(
+                self.kn.cpy.bitcast[
+                    type_of(self.ctx.compile_function[k_copy]())]()[],
+                self.a.buf.unsafe_ptr(), oh, ox, s * H,
+                grid_dim=ceildiv(s * H, BLOCK), block_dim=BLOCK)
+            self.a.reset(mark)
+            if (L_i & 3) == 3:
+                self.ctx.synchronize()
+        return rmsnorm_op(self.ctx, self.w.buf, self.a, ox, s,
+                          self.w.o("llm.norm.weight"), H, self.cfg.eps)
+
     def heads(mut self, oh: Int, rows: Int) raises -> Int:
-        return mm_op_t(self.ctx, self.w.buf, self.a, self.kn, oh, rows,
-                       self.cfg.hidden, self.w.o("audio_heads.weight"), HEADS_N)
+        return mm_op(self.ctx, self.w.buf, self.a, oh, rows,
+                     self.cfg.hidden, self.w.o("audio_heads.weight"), HEADS_N)
 
     def step(mut self, L: Int, T: Int, astart: Int, gc: GenConfig,
              mut preds: List[Float32], mut confs: List[Float32]) raises:
-        """One diffusion step: cond + uncond forward, CFG predict, read back."""
+        """One diffusion step: batched cond+uncond forward, CFG predict."""
         var mark = self.a.mark()
-        var oxc = self.forward_ids(True, L, astart)
-        var ocl = self.heads(oxc + (L - T) * self.cfg.hidden, T)
-        var oxu = self.forward_ids(False, T, 0)
-        var oul = self.heads(oxu, T)
+        var H = self.cfg.hidden
+        var onrm = self.forward_ids_batched(L, astart)
+        var ocl = self.heads(onrm + (L - T) * H, T)
+        var oul = self.heads(onrm + L * H + (L - T) * H, T)
         self.ctx.enqueue_function(
             self.kn.cfg.bitcast[
                 type_of(self.ctx.compile_function[k_cfg_predict]())]()[],

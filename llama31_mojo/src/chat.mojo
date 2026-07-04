@@ -92,14 +92,20 @@ def encode_turn(tok: PythonObject, question: String, first: Bool) raises -> List
 
 def generate(mut model: Llama, tok: PythonObject, ids: List[Int],
              temp: Float32, top_p: Float32) raises:
+    var greedy = temp <= 0
     var t0 = perf_counter_ns()
-    var logits = model.forward(ids)
-    var prefill_s = Float64(perf_counter_ns() - t0) / 1e9
     var out = List[Int]()
     var shown = String("")
+    var nxt: Int
+    var logits: List[Float32]
+    if greedy:
+        nxt = model.forward_argmax(ids)
+    else:
+        logits = model.forward(ids)
+        nxt = sample(logits, temp, top_p)
+    var prefill_s = Float64(perf_counter_ns() - t0) / 1e9
     t0 = perf_counter_ns()
     while model.n_cached < MAXLEN:
-        var nxt = sample(logits, temp, top_p)
         if nxt == EOT or nxt == EOS or nxt == EOM:
             break
         out.append(nxt)
@@ -113,7 +119,11 @@ def generate(mut model: Llama, tok: PythonObject, ids: List[Int],
             print(text[byte=ob:nb], end="", flush=True)
         shown = text
         var step: List[Int] = [nxt]
-        logits = model.forward(step)
+        if greedy:
+            nxt = model.forward_argmax(step)
+        else:
+            logits = model.forward(step)
+            nxt = sample(logits, temp, top_p)
     var dt = Float64(perf_counter_ns() - t0) / 1e9
     print()
     print("[", len(out), "tokens,", Float64(len(out)) / dt, "tok/s, prefill",

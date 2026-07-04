@@ -20,6 +20,7 @@ from llama_common import (
     Config, LayerOffs, Acts, BLOCK, TG, PAD,
     k_export, k_bf16_to_f32,
     llama3_inv_freq, mm_op, rmsnorm_op, run_layer, read_f32_bin,
+    read_argmax_gpu, read_logits_buf, argmax_op,
 )
 
 comptime VOCAB = 128256
@@ -167,6 +168,7 @@ struct Llama:
     var embed_stage: DeviceBuffer[DType.uint16]
     var a: Acts
     var lgbuf: DeviceBuffer[DType.float32]
+    var argbuf: DeviceBuffer[DType.int32]
     var lo: LayerOffs
     var kc: List[Int]
     var vc: List[Int]
@@ -188,6 +190,7 @@ struct Llama:
         var cache_elems = self.cfg.layers * 2 * maxlen * kvd
         self.a = Acts(ctx, PAD + self.cfg.half() + cache_elems + 64 * 1024 * 1024)
         self.lgbuf = ctx.enqueue_create_buffer[DType.float32](PAD + VOCAB)
+        self.argbuf = ctx.enqueue_create_buffer[DType.int32](1)
         self.kc = List[Int]()
         self.vc = List[Int]()
         self.maxlen = maxlen
@@ -227,7 +230,7 @@ struct Llama:
             grid_dim=ceildiv(s * H, BLOCK), block_dim=BLOCK)
         return ox
 
-    def forward(mut self, ids: List[Int]) raises -> List[Float32]:
+    def _run_forward(mut self, ids: List[Int]) raises:
         var s = len(ids)
         if self.n_cached + s > self.maxlen:
             raise Error("KV cache full")
@@ -247,15 +250,24 @@ struct Llama:
                               self.cfg.hidden, self.cfg.eps)
         var olg = mm_op(self.ctx, self.hot.buf, self.a, onrm, 1,
                         self.cfg.hidden, self.hot.lm, VOCAB)
-        self.ctx.enqueue_function[k_export](
+        self.ctx.enqueue_function(
+            self.a.kn.exp.bitcast[
+                type_of(self.ctx.compile_function[k_export]())]()[],
             self.a.buf.unsafe_ptr(), self.lgbuf.unsafe_ptr(), olg, PAD, VOCAB,
             grid_dim=ceildiv(VOCAB, BLOCK), block_dim=BLOCK)
         self.ctx.synchronize()
-        var logits = List[Float32](length=VOCAB, fill=0)
-        with self.lgbuf.map_to_host() as h:
-            memcpy(dest=logits.unsafe_ptr(), src=h.unsafe_ptr() + PAD, count=VOCAB)
         self.a.reset(mark)
-        return logits^
+
+    def forward(mut self, ids: List[Int]) raises -> List[Float32]:
+        self._run_forward(ids)
+        return read_logits_buf(self.lgbuf, VOCAB)
+
+    def forward_argmax(mut self, ids: List[Int]) raises -> Int:
+        """Greedy decode — GPU argmax, 4-byte host readback."""
+        self._run_forward(ids)
+        argmax_op(self.ctx, self.a, self.lgbuf, self.argbuf, PAD, VOCAB)
+        self.ctx.synchronize()
+        return read_argmax_gpu(self.argbuf)
 
 
 def load_llama(ctx: DeviceContext, maxlen: Int, warm: Bool = False) raises -> Llama:
@@ -278,7 +290,7 @@ def main() raises:
     t0 = perf_counter_ns()
     for _ in range(4):
         var step: List[Int] = [791]
-        _ = model.forward(step)
+        _ = model.forward_argmax(step)
     var dt = Float64(perf_counter_ns() - t0) / 1e9
     print("decode:", 4.0 / dt, "tok/s (", dt / 4.0 * 1000.0, "ms/tok )")
 

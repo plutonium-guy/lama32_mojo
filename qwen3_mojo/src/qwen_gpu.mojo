@@ -16,7 +16,7 @@ from llama_common import (
     Config, LayerOffs, Acts, BLOCK, PAD,
     k_embed_gather, k_export,
     rope_inv_freq, mm_op, rmsnorm_op, run_layer, read_f32_bin,
-    read_argmax_buf, read_logits_buf,
+    read_argmax_gpu, read_logits_buf, argmax_op,
 )
 from sample import argmax
 
@@ -57,6 +57,7 @@ struct Qwen:
     var w: Weights
     var a: Acts
     var lgbuf: DeviceBuffer[DType.float32]
+    var argbuf: DeviceBuffer[DType.int32]
     var idbuf: DeviceBuffer[DType.int32]
     var lo: List[LayerOffs]
     var kc: List[Int]
@@ -73,6 +74,7 @@ struct Qwen:
         var cache = self.cfg.layers * 2 * maxlen * kvd
         self.a = Acts(ctx, PAD + self.cfg.half() + cache + 32 * 1024 * 1024)
         self.lgbuf = ctx.enqueue_create_buffer[DType.float32](PAD + VOCAB)
+        self.argbuf = ctx.enqueue_create_buffer[DType.int32](1)
         self.idbuf = ctx.enqueue_create_buffer[DType.int32](maxlen)
         self.lo = List[LayerOffs]()
         self.kc = List[Int]()
@@ -150,7 +152,9 @@ struct Qwen:
 
     def forward_argmax(mut self, ids: List[Int]) raises -> Int:
         self._run_forward(ids)
-        return read_argmax_buf(self.lgbuf, VOCAB)
+        argmax_op(self.ctx, self.a, self.lgbuf, self.argbuf, PAD, VOCAB)
+        self.ctx.synchronize()
+        return read_argmax_gpu(self.argbuf)
 
 
 def load_qwen(ctx: DeviceContext, maxlen: Int) raises -> Qwen:
