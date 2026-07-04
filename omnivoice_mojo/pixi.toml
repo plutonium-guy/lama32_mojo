@@ -1,0 +1,34 @@
+[workspace]
+authors = ["amiya <amiya19mandal@gmail.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "omnivoice_mojo"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+# conda numpy and pip torch each ship a libomp; allow the duplicate.
+[activation.env]
+KMP_DUPLICATE_LIB_OK = "TRUE"
+
+[tasks]
+# shared kernels: ../src/llama_common.mojo, safetensors.mojo
+tts = "mojo run -I src -I ../src src/tts.mojo"
+test = "mojo run -I src -I ../src src/omnivoice_gpu.mojo"
+test-codec = "mojo run -I src -I ../src src/codec.mojo"
+build = "mojo build -I src -I ../src src/tts.mojo -o omnivoice_tts"
+download = "hf download k2-fsa/OmniVoice --local-dir assets/model"
+convert = "python scripts/prepare_model.py"
+oracle = "python scripts/gen_oracle.py"
+
+[dependencies]
+modular = ">=26.4.0,<27"
+python = ">=3.12"
+tokenizers = ">=0.22"
+numpy = ">=2"
+huggingface_hub = ">=1.20"
+
+[pypi-dependencies]
+torch = ">=2.4"
+torchaudio = ">=2.4"
+transformers = ">=5.3"
+soundfile = "*"
+safetensors = "*"

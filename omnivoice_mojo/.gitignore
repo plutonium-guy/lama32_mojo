@@ -1,0 +1,15 @@
+# model weights — pixi run download + pixi run convert
+assets/model/**/*.safetensors
+assets/model/.cache/
+assets/mojo/
+
+# oracle dumps + generated audio (regenerate: pixi run oracle)
+assets/oracle/*.bin
+*.wav
+
+# build artifacts
+omnivoice_tts
+
+# macOS exFAT AppleDouble litter
+._*
+.DS_Store
