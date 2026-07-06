@@ -123,9 +123,12 @@ struct OmniVoice:
         self.ctx = ctx
         self.cfg = make_config()
         self.w = w^
-        # per-layer scratch ~ 16*L^2 + 14e3*L floats; hidden slots + two
-        # (T, 8200) logit blocks persist across the per-layer resets.
-        var cap = PAD + 16 * maxlen * maxlen + 20000 * maxlen + 8 * 1024 * 1024
+        # per-layer scratch: cond scores 16*(P+T)^2 + uncond 16*T^2 — worst
+        # case ~32*maxlen^2 when the text prefix is short next to T
+        # (overflowed the old 16x sizing on long spoken answers); plus
+        # ~14e3*L floats; hidden slots and two (T, 8200) logit blocks
+        # persist across the per-layer resets.
+        var cap = PAD + 36 * maxlen * maxlen + 20000 * maxlen + 8 * 1024 * 1024
         self.a = Acts(ctx, cap)
         self.kn = OvKernels(ctx)
         self.lo = List[LayerOffs]()

@@ -9,6 +9,8 @@ version = "0.1.0"
 # shared kernels: ../src/llama_common.mojo, safetensors.mojo
 chat = "mojo run -I src -I ../src src/chat.mojo"
 test = "mojo run -I src -I ../src src/qwen_gpu.mojo"
+# latent (soft-embedding) thinking prototype vs discrete baseline
+think = "mojo run -I src -I ../src src/latent_think.mojo"
 build = "mojo build -I src -I ../src src/chat.mojo -o qwen_chat"
 quantize = "python scripts/quantize.py"
 chat-q8 = "mojo run -I src -I ../src src/chat_q8.mojo"

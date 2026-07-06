@@ -12,6 +12,8 @@ KMP_DUPLICATE_LIB_OK = "TRUE"
 [tasks]
 # shared kernels: ../src/llama_common.mojo, safetensors.mojo
 tts = "mojo run -I src -I ../src src/tts.mojo"
+# joined pipeline: qwen3 latent thinking -> spoken answer
+talk = "mojo run -I src -I ../src -I ../qwen3_mojo/src src/talk.mojo"
 test = "mojo run -I src -I ../src src/omnivoice_gpu.mojo"
 test-codec = "mojo run -I src -I ../src src/codec.mojo"
 build = "mojo build -I src -I ../src src/tts.mojo -o omnivoice_tts"

@@ -300,7 +300,12 @@ def k_rope_qk_copy2(a: UnsafePointer[Float32, MutAnyOrigin],
                     oq: Int, ok: Int, ov: Int, okc: Int, ovc: Int,
                     oinv: Int, s: Int, pos0: Int,
                     nheads: Int, nkv: Int, qdim: Int, kvdim: Int, half: Int):
-    """Fused RoPE on q/k + append k/v to KV cache."""
+    """Fused RoPE on q/k + KV cache append (one dispatch).
+
+    Race-free by construction: each rope thread writes ITS rotated k pair
+    to both the k activation and the cache (no cross-thread read of a
+    value another thread rotates); v is not roped so its copy threads
+    are independent. Grid covers s*(nheads+nkv)*half + s*kvdim."""
     var nall = nheads + nkv
     var nrope = s * nall * half
     var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
@@ -312,22 +317,29 @@ def k_rope_qk_copy2(a: UnsafePointer[Float32, MutAnyOrigin],
         var freq = Float32(pos0 + i) * a[oinv + d]
         var c = cos(freq)
         var sn = sin(freq)
-        var base: Int
+        var y0: Float32
+        var y1: Float32
         if h < nheads:
-            base = oq + i * qdim + h * 2 * half
+            var base = oq + i * qdim + h * 2 * half
+            var x0 = a[base + d]
+            var x1 = a[base + half + d]
+            a[base + d] = x0 * c - x1 * sn
+            a[base + half + d] = x1 * c + x0 * sn
         else:
-            base = ok + i * kvdim + (h - nheads) * 2 * half
-        var x0 = a[base + d]
-        var x1 = a[base + half + d]
-        a[base + d] = x0 * c - x1 * sn
-        a[base + half + d] = x1 * c + x0 * sn
-    elif idx < nrope + 2 * s * kvdim:
-        var ci = idx - nrope
-        if ci < s * kvdim:
-            a[okc + pos0 * kvdim + ci] = a[ok + ci]
-        else:
-            var vi = ci - s * kvdim
-            a[ovc + pos0 * kvdim + vi] = a[ov + vi]
+            var hk = h - nheads
+            var base = ok + i * kvdim + hk * 2 * half
+            var x0 = a[base + d]
+            var x1 = a[base + half + d]
+            y0 = x0 * c - x1 * sn
+            y1 = x1 * c + x0 * sn
+            a[base + d] = y0
+            a[base + half + d] = y1
+            var cbase = okc + (pos0 + i) * kvdim + hk * 2 * half
+            a[cbase + d] = y0
+            a[cbase + half + d] = y1
+    elif idx < nrope + s * kvdim:
+        var vi = idx - nrope
+        a[ovc + pos0 * kvdim + vi] = a[ov + vi]
 
 
 def k_copy2(a: UnsafePointer[Float32, MutAnyOrigin],
@@ -532,6 +544,7 @@ struct Kernels(Copyable, Movable):
     var rms: KPtr
     var rms2: KPtr
     var rope: KPtr
+    var ropec: KPtr                     # fused rope + KV append
     var copy2: KPtr
     var scores: KPtr
     var softmax: KPtr
@@ -549,6 +562,7 @@ struct Kernels(Copyable, Movable):
         self.rms = _box(ctx.compile_function[k_rmsnorm_w]())
         self.rms2 = _box(ctx.compile_function[k_rmsnorm2_w]())
         self.rope = _box(ctx.compile_function[k_rope_qk]())
+        self.ropec = _box(ctx.compile_function[k_rope_qk_copy2]())
         self.copy2 = _box(ctx.compile_function[k_copy2]())
         self.scores = _box(ctx.compile_function[k_scores]())
         self.softmax = _box(ctx.compile_function[k_softmax_rows]())
@@ -660,8 +674,12 @@ def mm_op_t(ctx: DeviceContext, w: DeviceBuffer[DType.uint16], mut a: Acts,
 
 def mm_op(ctx: DeviceContext, w: DeviceBuffer[DType.uint16], mut a: Acts,
           ox: Int, s: Int, m: Int, owt: Int, n: Int) raises -> Int:
-    """Matmul dispatch: tiled for s==1 or s>=4, k_mm_w otherwise."""
-    if s == 1 or s >= 4:
+    """Matmul dispatch: tiled for s>=4; k_mm_w for s<=3.
+
+    s==1 is latency-bound: k_mm_w's one-output-per-group shape gives 8x
+    the threadgroups of the tile kernel and measures ~6x faster (30 vs
+    ~5 GMAC/s microbench) — parallelism beats load reuse at s==1."""
+    if s >= 4:
         return mm_op_t(ctx, w, a, ox, s, m, owt, n)
     return mm_op_w(ctx, w, a, ox, s, m, owt, n)
 
@@ -712,15 +730,13 @@ def run_layer(ctx: DeviceContext, w: DeviceBuffer[DType.uint16], mut a: Acts,
         oq = oqn
         okk = okn
     ctx.enqueue_function(
-        a.kn.rope.bitcast[type_of(ctx.compile_function[k_rope_qk]())]()[],
-        a.buf.unsafe_ptr(), oq, okk, oinv, s, pos0,
+        a.kn.ropec.bitcast[
+            type_of(ctx.compile_function[k_rope_qk_copy2]())]()[],
+        a.buf.unsafe_ptr(), oq, okk, ov, kc, vc, oinv, s, pos0,
         cfg.n_heads, cfg.n_kv, QD, KVD, cfg.half(),
-        grid_dim=ceildiv(s * (cfg.n_heads + cfg.n_kv) * cfg.half(), BLOCK),
+        grid_dim=ceildiv(
+            s * (cfg.n_heads + cfg.n_kv) * cfg.half() + s * KVD, BLOCK),
         block_dim=BLOCK)
-    ctx.enqueue_function(
-        a.kn.copy2.bitcast[type_of(ctx.compile_function[k_copy2]())]()[],
-        a.buf.unsafe_ptr(), okk, kc + pos0 * KVD, ov, vc + pos0 * KVD, s * KVD,
-        grid_dim=ceildiv(2 * s * KVD, BLOCK), block_dim=BLOCK)
     var osc = a.alloc(cfg.n_heads * s * nctx)
     ctx.enqueue_function(
         a.kn.scores.bitcast[type_of(ctx.compile_function[k_scores]())]()[],

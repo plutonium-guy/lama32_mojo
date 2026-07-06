@@ -13,3 +13,12 @@ assets/oracle/*.bin
 
 # build artifacts
 llama_chat
+
+# downloaded/converted model artifacts in any subproject
+# (gitignore paths with slashes are root-anchored — need **/)
+**/assets/model/
+**/assets/mojo/
+**/assets/oracle/*.bin
+*.incomplete
+answer.wav
+__pycache__/

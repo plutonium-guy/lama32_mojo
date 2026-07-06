@@ -16,7 +16,7 @@ from std.gpu import block_dim, block_idx, thread_idx, barrier
 from std.gpu.memory import AddressSpace
 from llama_common import (
     Config, LayerOffs, Acts, BLOCK, TG, TG_MM, PAD, MM_CHUNK_MACS, KPtr,
-    rmsnorm_op, k_rmsnorm2_w, k_rope_qk, k_copy2, k_res_add, k_add, k_swiglu_mul,
+    rmsnorm_op, k_rmsnorm2_w, k_rope_qk_copy2, k_res_add, k_add, k_swiglu_mul,
     k_softmax_rows, k_scores, k_att_out,
 )
 
@@ -180,15 +180,13 @@ def run_layer_q8(ctx: DeviceContext, w: DeviceBuffer[DType.uint16],
         oq = oqn
         okk = okn
     ctx.enqueue_function(
-        a.kn.rope.bitcast[type_of(ctx.compile_function[k_rope_qk]())]()[],
-        a.buf.unsafe_ptr(), oq, okk, oinv, s, pos0,
+        a.kn.ropec.bitcast[
+            type_of(ctx.compile_function[k_rope_qk_copy2]())]()[],
+        a.buf.unsafe_ptr(), oq, okk, ov, kc, vc, oinv, s, pos0,
         cfg.n_heads, cfg.n_kv, QD, KVD, cfg.half(),
-        grid_dim=ceildiv(s * (cfg.n_heads + cfg.n_kv) * cfg.half(), BLOCK),
+        grid_dim=ceildiv(
+            s * (cfg.n_heads + cfg.n_kv) * cfg.half() + s * KVD, BLOCK),
         block_dim=BLOCK)
-    ctx.enqueue_function(
-        a.kn.copy2.bitcast[type_of(ctx.compile_function[k_copy2]())]()[],
-        a.buf.unsafe_ptr(), okk, kc + pos0 * KVD, ov, vc + pos0 * KVD, s * KVD,
-        grid_dim=ceildiv(2 * s * KVD, BLOCK), block_dim=BLOCK)
     var osc = a.alloc(cfg.n_heads * s * nctx)
     ctx.enqueue_function(
         a.kn.scores.bitcast[type_of(ctx.compile_function[k_scores]())]()[],

@@ -1,0 +1,36 @@
+[workspace]
+authors = ["amiya <amiya19mandal@gmail.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "waypoint_mojo"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+# conda numpy and pip torch each ship a libomp; allow the duplicate.
+[activation.env]
+KMP_DUPLICATE_LIB_OK = "TRUE"
+
+[tasks]
+# shared kernels: ../src/llama_common.mojo, safetensors.mojo, resident.mojo
+test = "mojo run -I src -I ../src src/waypoint_gpu.mojo"
+run = "mojo run -I src -I ../src src/worldgen.mojo"
+build = "mojo build -I src -I ../src src/worldgen.mojo -o worldgen"
+download = "hf download Overworld/Waypoint-1.5-1B --local-dir assets/model --exclude 'assets/*'"
+convert = "python scripts/prepare_model.py"
+oracle = "python scripts/gen_oracle.py"
+
+[dependencies]
+modular = ">=26.4.0,<27"
+python = ">=3.12"
+numpy = ">=2"
+huggingface_hub = ">=1.20"
+
+[pypi-dependencies]
+torch = ">=2.7"
+einops = "*"
+tensordict = "*"
+diffusers = ">=0.35"
+transformers = ">=4.50"
+accelerate = "*"
+safetensors = "*"
+pillow = "*"
+peft = ">=0.19.1, <0.20"
